@@ -15,3 +15,9 @@ mrtmp.*
 /main/rsm1d
 /main/kvraft1d
 /main/shardgrp1d
+
+# profiling / test binaries / build output
+*.test
+*.prof
+*.pprof
+mr/mr-tmp-*/
