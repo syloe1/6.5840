@@ -9,30 +9,29 @@ package shardkv
 //
 
 import (
+	"time"
+
+	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp"
 
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
+	kvtest "6.5840/kvtest1"
 	"6.5840/shardkv1/shardctrler"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Clerk struct {
 	clnt *tester.Clnt
 	sck  *shardctrler.ShardCtrler
-	rcks   map[tester.Tgid]*shardgrp.Clerk
-	// You will have to modify this struct.
+	rcks map[tester.Tgid]*shardgrp.Clerk
 }
 
-// The tester calls MakeClerk and passes in a shardctrler so that
-// client can call it's Query method
 func MakeClerk(clnt *tester.Clnt, sck *shardctrler.ShardCtrler) kvtest.IKVClerk {
 	ck := &Clerk{
 		clnt: clnt,
 		sck:  sck,
 	}
 	ck.rcks = make(map[tester.Tgid]*shardgrp.Clerk)
-	// You'll have to add code here.
 	return ck
 }
 
@@ -41,19 +40,83 @@ func (ck *Clerk) GetClerk(gid tester.Tgid) (*shardgrp.Clerk, bool) {
 	return rck, ok
 }
 
-
-// Get a key from a shardgrp.  You can use shardcfg.Key2Shard(key) to
-// find the shard responsible for the key and ck.sck.Query() to read
-// the current configuration and lookup the servers in the group
-// responsible for key.  You can make a clerk for that group by
-// calling shardgrp.MakeClerk(ck.clnt, servers).
-func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
-	// You will have to modify this function.
-	return "", 0, ""
+func (ck *Clerk) getOrCreateClerk(gid tester.Tgid, servers []string) *shardgrp.Clerk {
+	if rck, ok := ck.rcks[gid]; ok {
+		return rck
+	}
+	rck := shardgrp.MakeClerk(ck.clnt, servers)
+	ck.rcks[gid] = rck
+	return rck
 }
 
-// Put a key to a shard group.
+func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
+	const maxWrongGroup = 50
+	wrongGroupCount := 0
+	for {
+		cfg := ck.sck.Query()
+		shard := shardcfg.Key2Shard(key)
+		gid, servers, ok := cfg.GidServers(shard)
+		if !ok || gid == 0 {
+			continue
+		}
+		rck := ck.getOrCreateClerk(gid, servers)
+		val, ver, err := rck.Get(key)
+		if err == rpc.OK || err == rpc.ErrNoKey {
+			return val, ver, err
+		}
+		if err == rpc.ErrWrongGroup {
+			wrongGroupCount++
+			if wrongGroupCount >= maxWrongGroup {
+				return "", 0, rpc.ErrNoKey
+			}
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if err == rpc.ErrWrongLeader {
+			continue
+		}
+		return val, ver, err
+	}
+}
+
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
-	// You will have to modify this function.
-	return ""
+	const maxWrongGroup = 50
+	wrongGroupCount := 0
+	firstAttempt := true
+	for {
+		cfg := ck.sck.Query()
+		shard := shardcfg.Key2Shard(key)
+		gid, servers, ok := cfg.GidServers(shard)
+		if !ok || gid == 0 {
+			continue
+		}
+		rck := ck.getOrCreateClerk(gid, servers)
+		err := rck.Put(key, value, version)
+		if err == rpc.OK {
+			return rpc.OK
+		}
+		if err == rpc.ErrWrongGroup {
+			wrongGroupCount++
+			if wrongGroupCount >= maxWrongGroup {
+				return rpc.ErrMaybe
+			}
+			time.Sleep(10 * time.Millisecond)
+			firstAttempt = false
+			continue
+		}
+		if err == rpc.ErrWrongLeader {
+			firstAttempt = false
+			continue
+		}
+		if err == rpc.ErrVersion {
+			if firstAttempt {
+				return rpc.ErrVersion
+			}
+			return rpc.ErrMaybe
+		}
+		if err == rpc.ErrMaybe {
+			return rpc.ErrMaybe
+		}
+		firstAttempt = false
+	}
 }
